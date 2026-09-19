@@ -1,0 +1,17 @@
+{
+  "name": "wa-gateway-baileys",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Gateway WhatsApp berbasis Baileys yang meniru sebagian API WAHA (untuk pesan bertombol native)",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/server.mjs"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc14",
+    "express": "^4.21.0",
+    "pino": "^9.0.0",
+    "sharp": "^0.33.0"
+  }
+}
