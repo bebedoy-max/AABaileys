@@ -58,7 +58,6 @@ const ACK_WAIT_MS = Number(process.env.ACK_WAIT_MS || 3000);
 // dari nomor itu ditahan. Setiap penolakan beruntun menggandakan waktu tahan (maks 24 jam).
 const RESTRICT_COOLDOWN_MIN = Number(process.env.RESTRICT_COOLDOWN_MIN || 60);
 const ERROR_STREAK_TRIP = Number(process.env.ERROR_STREAK_TRIP || 3);
-<<<<<<< HEAD
 // Perlindungan SSRF untuk file dari URL: tolak alamat internal (localhost, 10.x, 192.168.x, 169.254.x, dst).
 // Kalau perlu mengizinkan host internal tertentu, isi daftar host dipisah koma. Contoh: "supabase-kong,minio".
 const ALLOW_PRIVATE_MEDIA_HOSTS = new Set(
@@ -68,8 +67,6 @@ const ALLOW_PRIVATE_MEDIA_HOSTS = new Set(
     .filter(Boolean),
 );
 const MEDIA_MAX_BYTES = Number(process.env.MEDIA_MAX_MB || 25) * 1024 * 1024;
-=======
->>>>>>> cb9f21542c1ea9bc4600cb86af2a9dc752a56fc7
 
 if (!API_KEY) {
   console.error('API_KEY wajib diisi (environment variable). Server dihentikan.');
