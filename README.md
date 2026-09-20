@@ -6,8 +6,9 @@ bisa memakainya lewat menu **Pengaturan Sistem > WA Gateway** (URL + API key) ta
 Keunggulan utamanya: bisa mengirim **pesan bertombol native** (tombol link, balas, telepon, salin kode)
 yang tidak bisa dikirim WAHA engine GOWS.
 
-> **Status:** versi awal. Sintaksnya sudah dicek, tapi belum diuji langsung ke WhatsApp.
-> Ikuti alur uji bertahap di bawah, jangan langsung memindahkan semua perangkat.
+> **Status:** sudah terpakai untuk pengiriman tombol nyata. Logika pemantauan hasil pengiriman dan
+> penahanan nomor (lihat bagian "Arti Berhasil dan perlindungan nomor") diuji secara lokal, belum
+> dibuktikan terhadap penolakan asli dari WhatsApp. Cek log setelah pengiriman pertama.
 
 ## Ringkasan strategi
 
@@ -52,6 +53,11 @@ Nama menu di Coolify bisa sedikit berbeda antar versi.
 | `APP_INBOUND_URL` | tidak | `https://DOMAIN-APLIKASI/api/public/wa/inbound`, untuk meneruskan balasan STOP/BERHENTI (fitur Anti Ban). |
 | `WA_CRON_SECRET` | tidak | Samakan dengan `WA_CRON_SECRET` di aplikasi. Wajib bila `APP_INBOUND_URL` diisi. |
 | `LOG_LEVEL` | tidak | `warn` (default). Pakai `info` atau `debug` saat mencari masalah. |
+| `ACK_WAIT_MS` | tidak | Berapa lama gateway menunggu kabar server WhatsApp setelah mengirim. Default `3000`. |
+| `RESTRICT_COOLDOWN_MIN` | tidak | Lama nomor ditahan setelah ditolak WhatsApp. Default `60` menit, menggandakan tiap kejadian beruntun (maks 24 jam). |
+| `ERROR_STREAK_TRIP` | tidak | Jumlah penolakan beruntun (selain kode 463) sebelum nomor ditahan. Default `3`. |
+| `ALLOW_PRIVATE_MEDIA_HOSTS` | tidak | Daftar host internal (dipisah koma) yang boleh diambil filenya. Default kosong: URL file ke localhost/10.x/192.168.x/169.254.x ditolak (perlindungan SSRF). |
+| `MEDIA_MAX_MB` | tidak | Ukuran maksimal file media (MB). Default `25`. |
 
 ## Cek server sudah hidup
 
@@ -86,6 +92,30 @@ Sesi di WAHA tidak tersentuh, jadi perangkat lama langsung tersambung lagi.
 `GET /api/:name/profile`, `PUT /api/:name/profile/name|picture`.
 
 Tipe tombol pada `/api/sendButtons`: `url`, `reply`, `call`, `copy` (maksimal 3 tombol per pesan).
+
+## Arti "Berhasil" dan perlindungan nomor
+
+Setelah mengirim, gateway menunggu kabar dari server WhatsApp (maksimal `ACK_WAIT_MS`):
+
+- **Ditolak server** (mis. nomor dibatasi): dibalas error, jadi di aplikasi tercatat gagal dan tidak
+  dihitung sebagai terkirim. Keterangannya berisi kode penolakan.
+- **Ada tanda diterima penerima**: langsung dibalas sukses.
+- **Tidak ada kabar apa pun**: dianggap sukses (penerima bisa saja sedang offline). Jadi "Berhasil"
+  berarti "tidak ditolak WhatsApp", belum jaminan pesan sudah dibaca.
+
+**Penahanan nomor.** Kode penolakan `463` (pembatasan pengiriman) atau `ERROR_STREAK_TRIP` penolakan
+beruntun membuat nomor itu ditahan selama `RESTRICT_COOLDOWN_MIN` menit (menggandakan tiap kali, maks 24 jam;
+koneksi yang ditolak WhatsApp dengan kode 403 ditahan 24 jam). Selama ditahan:
+
+- perangkat dilaporkan terputus ke aplikasi, sehingga aplikasi berhenti membagikan pesan ke nomor itu;
+- alasan dan jam berakhirnya tampil sebagai keterangan error di aplikasi;
+- status ini tersimpan di `/data`, jadi tetap berlaku setelah redeploy.
+
+Hapus penahanan manual (hanya jika WhatsApp sudah mencabut pembatasan):
+
+```bash
+curl -X POST -H "X-Api-Key: KUNCI_KAMU" https://wb.aawb.web.id/api/sessions/ID_SESI/clear-restriction
+```
 
 ## Batasan yang perlu diketahui
 

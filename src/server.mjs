@@ -25,6 +25,8 @@ import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import dns from 'node:dns/promises';
+import net from 'node:net';
 import P from 'pino';
 import makeWASocket, {
   Browsers,
@@ -49,6 +51,22 @@ const BUTTON_WRAP = process.env.BUTTON_WRAP === '1';
 const APP_INBOUND_URL = process.env.APP_INBOUND_URL || '';
 const WA_CRON_SECRET = process.env.WA_CRON_SECRET || '';
 const LOG_LEVEL = process.env.LOG_LEVEL || 'warn';
+// Berapa lama (ms) gateway menunggu kabar dari server WhatsApp setelah mengirim pesan.
+// Penolakan server biasanya datang < 1 detik; tanda "diterima penerima" mempercepat balasan.
+const ACK_WAIT_MS = Number(process.env.ACK_WAIT_MS || 3000);
+// Perlindungan nomor: setelah WhatsApp menolak pesan (mis. kode 463 = dibatasi), pengiriman
+// dari nomor itu ditahan. Setiap penolakan beruntun menggandakan waktu tahan (maks 24 jam).
+const RESTRICT_COOLDOWN_MIN = Number(process.env.RESTRICT_COOLDOWN_MIN || 60);
+const ERROR_STREAK_TRIP = Number(process.env.ERROR_STREAK_TRIP || 3);
+// Perlindungan SSRF untuk file dari URL: tolak alamat internal (localhost, 10.x, 192.168.x, 169.254.x, dst).
+// Kalau perlu mengizinkan host internal tertentu, isi daftar host dipisah koma. Contoh: "supabase-kong,minio".
+const ALLOW_PRIVATE_MEDIA_HOSTS = new Set(
+  (process.env.ALLOW_PRIVATE_MEDIA_HOSTS || '')
+    .split(',')
+    .map((h) => h.trim().toLowerCase())
+    .filter(Boolean),
+);
+const MEDIA_MAX_BYTES = Number(process.env.MEDIA_MAX_MB || 25) * 1024 * 1024;
 
 if (!API_KEY) {
   console.error('API_KEY wajib diisi (environment variable). Server dihentikan.');
@@ -122,6 +140,12 @@ function newSession(name, dir) {
     timer: null,
     lastUser: null,
     sent: new Map(), // cache pesan terkirim untuk getMessage (retry Baileys)
+    verdicts: new Map(), // id pesan -> hasil dari server WhatsApp { ok, code|via }
+    waiters: new Map(), // id pesan -> fungsi yang menunggu hasil
+    errStreak: 0, // penolakan beruntun
+    tripCount: 0, // berapa kali pengiriman ditahan berturut-turut
+    restrictedUntil: 0, // epoch ms; > sekarang = pengiriman ditahan
+    restrictReason: '',
   };
 }
 
@@ -148,6 +172,129 @@ function wipeAuth(s) {
     }
   } catch (err) {
     logger.warn({ err, session: s.name }, 'gagal menghapus data auth');
+  }
+}
+
+/* ------------------- hasil pengiriman & perlindungan nomor ------------------- */
+
+const statePath = (s) => path.join(s.dir, 'state.json');
+
+function saveState(s) {
+  try {
+    fs.writeFileSync(
+      statePath(s),
+      JSON.stringify({
+        restrictedUntil: s.restrictedUntil,
+        restrictReason: s.restrictReason,
+        tripCount: s.tripCount,
+      }),
+    );
+  } catch (err) {
+    logger.warn({ err: err?.message, session: s.name }, 'gagal menyimpan state pembatasan');
+  }
+}
+
+function loadState(s) {
+  try {
+    const j = JSON.parse(fs.readFileSync(statePath(s), 'utf8'));
+    s.restrictedUntil = Number(j.restrictedUntil) || 0;
+    s.restrictReason = String(j.restrictReason || '');
+    s.tripCount = Number(j.tripCount) || 0;
+  } catch {
+    /* belum ada state */
+  }
+}
+
+const isRestricted = (s) => s.restrictedUntil > Date.now();
+
+const clockWib = (ms) =>
+  new Date(ms).toLocaleTimeString('id-ID', { timeZone: 'Asia/Jakarta', hour: '2-digit', minute: '2-digit' });
+
+function restrictedMessage(s) {
+  return `Nomor pengirim dibatasi WhatsApp (${s.restrictReason || 'ditolak server'}); pengiriman dari nomor ini ditahan sampai ${clockWib(s.restrictedUntil)} WIB.`;
+}
+
+function resetRestriction(s) {
+  s.restrictedUntil = 0;
+  s.restrictReason = '';
+  s.tripCount = 0;
+  s.errStreak = 0;
+}
+
+/** Tahan pengiriman dari sesi ini. Waktu tahan menggandakan tiap kejadian beruntun. */
+function tripRestriction(s, reason, minutesOverride) {
+  s.tripCount += 1;
+  const minutes =
+    minutesOverride ?? Math.min(RESTRICT_COOLDOWN_MIN * 2 ** (s.tripCount - 1), 24 * 60);
+  s.restrictedUntil = Date.now() + minutes * 60_000;
+  s.restrictReason = reason;
+  s.errStreak = 0;
+  saveState(s);
+  logger.warn({ session: s.name, reason, minutes }, 'pengiriman dari nomor ini ditahan');
+}
+
+// Status pesan Baileys: ERROR=0, PENDING=1, SERVER_ACK=2, DELIVERY_ACK=3, READ=4, PLAYED=5
+const ST = { ERROR: 0, SERVER_ACK: 2, DELIVERY_ACK: 3 };
+
+function statusNumber(v) {
+  if (typeof v === 'number') return v;
+  if (typeof v === 'string') {
+    const n = proto.WebMessageInfo?.Status?.[v];
+    return typeof n === 'number' ? n : -1;
+  }
+  return -1;
+}
+
+/** Catat kabar status pesan keluar dari server WhatsApp (penolakan atau tanda diterima). */
+function recordAck(s, update) {
+  const key = update?.key;
+  const status = update?.update?.status;
+  if (!key?.fromMe || !key.id || status === undefined) return;
+
+  const st = statusNumber(status);
+  let verdict = null;
+  if (st === ST.ERROR) {
+    verdict = { ok: false, code: String(update.update.messageStubParameters?.[0] ?? '?') };
+  } else if (st >= ST.SERVER_ACK) {
+    verdict = { ok: true, via: st >= ST.DELIVERY_ACK ? 'delivered' : 'server' };
+  }
+  if (!verdict) return;
+
+  s.verdicts.set(key.id, verdict);
+  if (s.verdicts.size > 500) s.verdicts.delete(s.verdicts.keys().next().value);
+  const waiter = s.waiters.get(key.id);
+  if (waiter) waiter(verdict);
+}
+
+/** Tunggu hasil pesan: ditolak (gagal), diterima (sukses), atau habis waktu (dianggap terkirim). */
+function awaitVerdict(s, id, ms) {
+  const known = s.verdicts.get(id);
+  if (known) return Promise.resolve(known);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      s.waiters.delete(id);
+      resolve({ ok: true, via: 'timeout' });
+    }, ms);
+    s.waiters.set(id, (verdict) => {
+      clearTimeout(timer);
+      s.waiters.delete(id);
+      resolve(verdict);
+    });
+  });
+}
+
+/** Perbarui penghitung penolakan dan tahan nomor bila perlu. */
+function applyVerdict(s, verdict) {
+  if (verdict.ok) {
+    s.errStreak = 0;
+    if (verdict.via === 'delivered') s.tripCount = 0;
+    return;
+  }
+  s.errStreak += 1;
+  logger.warn({ session: s.name, code: verdict.code, streak: s.errStreak }, 'pesan ditolak server WhatsApp');
+  // 463 = pembatasan pengiriman ke kontak baru; jangan diulang-ulang.
+  if (verdict.code === '463' || s.errStreak >= ERROR_STREAK_TRIP) {
+    tripRestriction(s, `kode ${verdict.code}`);
   }
 }
 
@@ -201,6 +348,10 @@ async function connect(s) {
 
   sock.ev.on('creds.update', auth.saveCreds);
   sock.ev.on('connection.update', (update) => onConnection(s, sock, gen, update));
+  sock.ev.on('messages.update', (updates) => {
+    if (gen !== s.gen) return;
+    for (const u of updates) recordAck(s, u);
+  });
   sock.ev.on('messages.upsert', (payload) => {
     if (gen !== s.gen) return;
     onMessages(s, payload).catch((err) => logger.warn({ err }, 'gagal memproses pesan masuk'));
@@ -242,7 +393,17 @@ function onConnection(s, sock, gen, { connection, lastDisconnect, qr }) {
     logger.warn({ session: s.name }, 'sesi logout dari WhatsApp; data auth dihapus');
     teardown(s);
     wipeAuth(s);
+    resetRestriction(s);
     s.lastUser = null;
+    s.rawStatus = 'STOPPED';
+    return;
+  }
+
+  // Akun ditolak WhatsApp (dibatasi/diblokir): jangan disambung ulang berulang-ulang.
+  if (code === DisconnectReason.forbidden) {
+    logger.warn({ session: s.name }, 'koneksi ditolak WhatsApp (403); pengiriman ditahan 24 jam');
+    teardown(s);
+    tripRestriction(s, 'koneksi ditolak WhatsApp (403)', 24 * 60);
     s.rawStatus = 'STOPPED';
     return;
   }
@@ -343,6 +504,72 @@ function sniffMime(buf) {
   return null;
 }
 
+/* ------------------- perlindungan SSRF untuk file dari URL ------------------- */
+
+function isPrivateIp(ip) {
+  if (net.isIPv4(ip)) {
+    const [a, b] = ip.split('.').map(Number);
+    return (
+      a === 0 || a === 10 || a === 127 ||
+      (a === 100 && b >= 64 && b <= 127) || // carrier-grade NAT
+      (a === 169 && b === 254) || // link-local, termasuk metadata cloud
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      a >= 224 // multicast/reserved
+    );
+  }
+  if (net.isIPv6(ip)) {
+    const v = ip.toLowerCase();
+    if (v === '::1' || v === '::') return true;
+    const mapped = v.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    if (mapped) return isPrivateIp(mapped[1]);
+    return /^(fc|fd|fe[89ab])/.test(v); // unique-local dan link-local
+  }
+  return true; // bukan IP valid: anggap tidak aman
+}
+
+/** Hanya izinkan http(s) ke alamat publik. Melempar HttpError bila tidak aman. */
+async function assertPublicUrl(rawUrl) {
+  let u;
+  try {
+    u = new URL(rawUrl);
+  } catch {
+    throw new HttpError(422, 'URL file tidak valid');
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+    throw new HttpError(422, 'URL file harus http atau https');
+  }
+  const host = u.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (ALLOW_PRIVATE_MEDIA_HOSTS.has(host)) return;
+
+  let addrs;
+  if (net.isIP(host)) {
+    addrs = [{ address: host }];
+  } else {
+    try {
+      addrs = await dns.lookup(host, { all: true });
+    } catch {
+      throw new HttpError(422, 'Host file tidak dapat ditemukan');
+    }
+  }
+  if (!addrs.length || addrs.some((a) => isPrivateIp(a.address))) {
+    throw new HttpError(422, 'URL file mengarah ke alamat internal dan ditolak');
+  }
+}
+
+async function readLimited(res, maxBytes) {
+  const declared = Number(res.headers.get('content-length') || 0);
+  if (declared && declared > maxBytes) throw new HttpError(422, 'File terlalu besar');
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of res.body) {
+    total += chunk.length;
+    if (total > maxBytes) throw new HttpError(422, 'File terlalu besar');
+    chunks.push(Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
+
 /** Muat file dari { url } atau { data (base64) } seperti format WAHA. */
 async function loadFile(file) {
   if (!file || typeof file !== 'object') throw new HttpError(422, 'file wajib diisi');
@@ -351,15 +578,28 @@ async function loadFile(file) {
 
   if (file.data) {
     buffer = Buffer.from(String(file.data), 'base64');
+    if (buffer.length > MEDIA_MAX_BYTES) throw new HttpError(422, 'File terlalu besar');
   } else if (file.url) {
+    let url = String(file.url);
     let res;
     try {
-      res = await fetch(String(file.url), { signal: AbortSignal.timeout(30_000) });
+      for (let hop = 0; hop <= 3; hop += 1) {
+        await assertPublicUrl(url);
+        res = await fetch(url, { redirect: 'manual', signal: AbortSignal.timeout(30_000) });
+        if ([301, 302, 303, 307, 308].includes(res.status)) {
+          const next = res.headers.get('location');
+          if (!next) break;
+          url = new URL(next, url).toString(); // diperiksa ulang di putaran berikutnya
+          continue;
+        }
+        break;
+      }
     } catch (err) {
+      if (err instanceof HttpError) throw err;
       throw new HttpError(422, `Gagal mengunduh file: ${err?.message || err}`);
     }
-    if (!res.ok) throw new HttpError(422, `Gagal mengunduh file (HTTP ${res.status})`);
-    buffer = Buffer.from(await res.arrayBuffer());
+    if (!res || !res.ok) throw new HttpError(422, `Gagal mengunduh file (HTTP ${res?.status ?? '?'})`);
+    buffer = await readLimited(res, MEDIA_MAX_BYTES);
     headerMime = res.headers.get('content-type')?.split(';')[0] || null;
   } else {
     throw new HttpError(422, 'file.url atau file.data wajib diisi');
@@ -376,6 +616,7 @@ async function loadFile(file) {
 /** Sesi harus WORKING; kalau tidak, pesan belum terkirim sama sekali (aman diulang aplikasi). */
 function target(body) {
   const s = getSession(body?.session);
+  if (isRestricted(s)) throw new HttpError(503, restrictedMessage(s));
   if (s.rawStatus !== 'WORKING' || !s.sock) {
     throw new HttpError(422, 'Session status is not as expected');
   }
@@ -409,7 +650,16 @@ function sendRoute(handler) {
       throw classifySendError(err);
     }
     remember(ctx.s, sent);
-    res.json({ id: sent?.key?.id ?? null, key: sent?.key ?? null });
+
+    // "Berhasil" hanya jika server WhatsApp tidak menolak pesan itu.
+    const id = sent?.key?.id ?? null;
+    const verdict = id ? await awaitVerdict(ctx.s, id, ACK_WAIT_MS) : { ok: true, via: 'noid' };
+    applyVerdict(ctx.s, verdict);
+    if (!verdict.ok) {
+      const suffix = isRestricted(ctx.s) ? ` ${restrictedMessage(ctx.s)}` : '';
+      throw new HttpError(503, `Pesan ditolak server WhatsApp (kode ${verdict.code}).${suffix}`);
+    }
+    res.json({ id, key: sent?.key ?? null, delivery: verdict.via });
   });
 }
 
@@ -496,9 +746,14 @@ app.use('/api', (req, res, next) => {
 function sessionPayload(s) {
   const user = s.sock?.user || s.lastUser;
   const phone = user ? phoneOf(user.id) : '';
+  const held = isRestricted(s);
   return {
     name: s.name,
-    status: s.rawStatus,
+    // Saat ditahan, dilaporkan STOPPED agar aplikasi berhenti membagikan pesan ke nomor ini.
+    status: held ? 'STOPPED' : s.rawStatus,
+    ...(held
+      ? { restriction: { reason: s.restrictReason, until: new Date(s.restrictedUntil).toISOString() } }
+      : {}),
     config: {},
     // Aplikasi hanya mengirim gambar + tombol sekaligus jika engine = NOWEB.
     engine: { engine: REPORT_ENGINE },
@@ -527,6 +782,8 @@ app.post(
   '/api/sessions/:name/start',
   wrap(async (req, res) => {
     const s = getSession(req.params.name);
+    // Nomor sedang ditahan: jangan disambung ulang. Alasannya ikut tampil di aplikasi.
+    if (isRestricted(s)) throw new HttpError(503, restrictedMessage(s));
     if (!['STARTING', 'SCAN_QR_CODE', 'WORKING'].includes(s.rawStatus)) {
       connect(s).catch((err) => logger.error({ err, session: s.name }, 'gagal memulai sesi'));
     }
@@ -538,9 +795,23 @@ app.post(
   '/api/sessions/:name/stop',
   wrap(async (req, res) => {
     const s = getSession(req.params.name);
-    teardown(s);
-    s.rawStatus = 'STOPPED';
+    // Saat ditahan, koneksi dibiarkan (tidak diputus-sambung berulang oleh pemulihan otomatis aplikasi).
+    if (!isRestricted(s)) {
+      teardown(s);
+      s.rawStatus = 'STOPPED';
+    }
     res.status(201).json(sessionPayload(s));
+  }),
+);
+
+// Hapus status "ditahan" secara manual (mis. setelah pembatasan WhatsApp dicabut).
+app.post(
+  '/api/sessions/:name/clear-restriction',
+  wrap(async (req, res) => {
+    const s = getSession(req.params.name);
+    resetRestriction(s);
+    saveState(s);
+    res.json(sessionPayload(s));
   }),
 );
 
@@ -557,6 +828,7 @@ app.post(
     }
     teardown(s);
     wipeAuth(s);
+    resetRestriction(s);
     s.lastUser = null;
     s.rawStatus = 'STOPPED';
     res.status(201).json(sessionPayload(s));
@@ -787,6 +1059,7 @@ async function boot() {
     if (!VALID_NAME.test(name)) continue;
 
     const s = newSession(name, dir);
+    loadState(s);
     sessions.set(name, s);
 
     let registered = false;
@@ -795,7 +1068,9 @@ async function boot() {
     } catch {
       /* belum ada kredensial */
     }
-    if (registered) {
+    if (registered && isRestricted(s)) {
+      console.log(`sesi ${name} sedang ditahan sampai ${clockWib(s.restrictedUntil)} WIB (${s.restrictReason}); tidak disambungkan otomatis`);
+    } else if (registered) {
       connect(s).catch((err) => logger.error({ err, session: name }, 'gagal auto-start sesi'));
       await sleep(500);
     }
@@ -805,7 +1080,8 @@ async function boot() {
     console.log(
       `wa-gateway-baileys aktif di :${PORT} | sesi dimuat: ${sessions.size} | engine dilaporkan: ${REPORT_ENGINE} | ` +
         `bot-node: ${BUTTON_BOT_NODE ? 'ya' : 'tidak'} | wrap: ${BUTTON_WRAP ? 'ya' : 'tidak'} | ` +
-        `inbound: ${APP_INBOUND_URL && WA_CRON_SECRET ? 'aktif' : 'nonaktif'}`,
+        `inbound: ${APP_INBOUND_URL && WA_CRON_SECRET ? 'aktif' : 'nonaktif'} | ` +
+        `tunggu-ack: ${ACK_WAIT_MS}ms | tahan-nomor: ${RESTRICT_COOLDOWN_MIN}mnt`,
     );
   });
 }
