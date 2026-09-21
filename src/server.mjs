@@ -570,6 +570,54 @@ async function readLimited(res, maxBytes) {
   return Buffer.concat(chunks);
 }
 
+/* ---------------------- cache file & gambar header ------------------------ *
+ * Kampanye mengirim gambar yang SAMA ke ribuan penerima. Dulu setiap pesan mengunduh ulang
+ * gambar dari URL lalu mengunggahnya ulang ke server WhatsApp (beberapa detik per pesan).
+ *  - FILE_CACHE: hasil unduhan disimpan singkat di memori (per URL / per isi base64).
+ *  - s.headerCache: hasil unggah gambar header per SESI dipakai ulang oleh sesi yang sama.
+ *    Sengaja per sesi (bukan global) agar tiap nomor pengirim tetap memakai unggahannya sendiri.
+ */
+const FILE_CACHE_TTL_MS = 10 * 60_000;
+const FILE_CACHE_MAX = 20;
+const HEADER_CACHE_TTL_MS = 30 * 60_000;
+const HEADER_CACHE_MAX = 5;
+const FILE_CACHE = new Map(); // kunci -> { at, value: { buffer, mimetype, filename } }
+
+function fileCacheKey(file) {
+  if (file?.data) return 'd:' + crypto.createHash('sha256').update(String(file.data)).digest('hex');
+  if (file?.url) return 'u:' + String(file.url);
+  return null;
+}
+
+async function loadFileCached(file) {
+  const key = fileCacheKey(file);
+  const hit = key ? FILE_CACHE.get(key) : null;
+  if (hit && Date.now() - hit.at < FILE_CACHE_TTL_MS) return hit.value;
+  const value = await loadFile(file);
+  if (key) {
+    FILE_CACHE.set(key, { at: Date.now(), value });
+    while (FILE_CACHE.size > FILE_CACHE_MAX) FILE_CACHE.delete(FILE_CACHE.keys().next().value);
+  }
+  return value;
+}
+
+/** Gambar header yang sudah diunggah oleh sesi ini (salinan baru tiap pakai), atau null. */
+function cachedHeaderImage(s, hash) {
+  const hit = s.headerCache?.get(hash);
+  if (!hit) return null;
+  if (Date.now() - hit.at > HEADER_CACHE_TTL_MS) {
+    s.headerCache.delete(hash);
+    return null;
+  }
+  return proto.Message.ImageMessage.decode(hit.bytes);
+}
+
+function rememberHeaderImage(s, hash, imageMessage) {
+  if (!s.headerCache) s.headerCache = new Map();
+  s.headerCache.set(hash, { at: Date.now(), bytes: proto.Message.ImageMessage.encode(imageMessage).finish() });
+  while (s.headerCache.size > HEADER_CACHE_MAX) s.headerCache.delete(s.headerCache.keys().next().value);
+}
+
 /** Muat file dari { url } atau { data (base64) } seperti format WAHA. */
 async function loadFile(file) {
   if (!file || typeof file !== 'object') throw new HttpError(422, 'file wajib diisi');
@@ -934,7 +982,7 @@ app.post(
 
 app.post(
   '/api/sendButtons',
-  sendRoute(async ({ sock, jid }, body) => {
+  sendRoute(async ({ s, sock, jid }, body) => {
     const buttons = (Array.isArray(body.buttons) ? body.buttons : [])
       .slice(0, 3)
       .map(toNativeButton)
@@ -943,14 +991,20 @@ app.post(
 
     let header = { hasMediaAttachment: false };
     if (body.headerImage) {
-      const f = await loadFile(body.headerImage);
-      const media = await generateWAMessage(
-        jid,
-        { image: f.buffer, mimetype: f.mimetype },
-        { userJid: sock.user.id, upload: sock.waUploadToServer },
-      );
-      if (!media?.message?.imageMessage) throw new HttpError(500, 'Gagal mengunggah gambar header');
-      header = { hasMediaAttachment: true, imageMessage: media.message.imageMessage };
+      const f = await loadFileCached(body.headerImage);
+      const hash = crypto.createHash('sha256').update(f.buffer).digest('hex');
+      let imageMessage = cachedHeaderImage(s, hash);
+      if (!imageMessage) {
+        const media = await generateWAMessage(
+          jid,
+          { image: f.buffer, mimetype: f.mimetype },
+          { userJid: sock.user.id, upload: sock.waUploadToServer },
+        );
+        if (!media?.message?.imageMessage) throw new HttpError(500, 'Gagal mengunggah gambar header');
+        imageMessage = media.message.imageMessage;
+        rememberHeaderImage(s, hash, imageMessage);
+      }
+      header = { hasMediaAttachment: true, imageMessage };
     } else if (optionalText(body.header)) {
       header = { title: optionalText(body.header), hasMediaAttachment: false };
     }
